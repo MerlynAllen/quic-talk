@@ -1,5 +1,5 @@
 [package]
-name = "quinn-test"
+name = "quic-talk"
 version = "0.1.0"
 edition = "2021"
 
@@ -50,3 +50,4 @@ clap = { version = "4.2.1", features = ["derive"] }
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
 tracing-futures = { version = "0.2.0", default-features = false, features = ["std-future"] }
 url = "2"
+config = "0.13.3"

@@ -1,1 +1,5 @@
 /target
+/server.key
+/server.pem
+/.idea
+/.vscode
