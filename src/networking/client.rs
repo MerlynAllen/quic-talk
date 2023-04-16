@@ -3,46 +3,29 @@ use std::{
     io::{self, Write},
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc},
     time::{Duration, Instant},
 };
-
+use tokio::sync::{RwLock, Mutex};
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use tracing::{error, info, debug};
-use url::Url;
+use tracing::{debug, error, info};
 
 use crate::networking::common;
+use crate::networking::session::{QuicTalkSession, QuicTalkSessionState};
 use crate::Opt;
 use crate::QuicTalkState;
-use crate::networking::session::{QuicTalkSession, QuicTalkSessionState};
-const QUIC_DEFAULT_PORT: u16 = 4433;
 
-
-
-pub(crate) async fn client(options: Opt, global_states: QuicTalkState) -> Result<()> {
-    let url = match Url::parse(&options.remote) {
-        Ok(u) => u,
-        Err(_) => bail!("cannot parse URL."),
-    };
-    // Check scheme
-    if url.scheme() != "https" {
-        bail!("URL Scheme can only be \"https\".")
-    }
-    let host = match url.host_str() {
-        Some(h) => h,
-        None => bail!("invalid URL"),
-    };
-    let port = match url.port() {
-        Some(p) => p,
-        None => QUIC_DEFAULT_PORT,
-    };
-    // Remote socket
-    let remote = format!("{host}:{port}")
+pub(crate) async fn client(
+    hostname: String,
+    port: u16,
+    options: Opt,
+    global_states: Arc<QuicTalkState>,
+) -> Result<()> {
+    let remote = format!("{hostname}:{port}")
         .to_socket_addrs()?
         .next()
-        .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
-
+        .ok_or(anyhow!("invalid hostname or port"))?;
     // Read trusted CA cert
     // (Able to add multiple CA certs)
     let mut roots = rustls::RootCertStore::empty();
@@ -50,7 +33,7 @@ pub(crate) async fn client(options: Opt, global_states: QuicTalkState) -> Result
         roots.add(&rustls::Certificate(fs::read(ca_path)?))?;
     } else {
         // Get certs from program data dir.
-        let dirs = directories_next::ProjectDirs::from("org", "quinn", "quinn-examples").unwrap();
+        let dirs = directories_next::ProjectDirs::from("dev", "merlyn", "quic-talk").unwrap();
         match fs::read(dirs.data_local_dir().join("cert.der")) {
             Ok(cert) => {
                 roots.add(&rustls::Certificate(cert))?;
@@ -83,37 +66,39 @@ pub(crate) async fn client(options: Opt, global_states: QuicTalkState) -> Result
     let start = Instant::now();
     let rebind = options.rebind;
     // Remote host name overwrite
-    let host = options
+    let hostname = options
         .host
         .as_ref()
-        .map_or_else(|| Some(host), |x| Some(x))
+        .map_or_else(|| Some(hostname), |x| Some(x.to_string()))
         .ok_or_else(|| anyhow!("no hostname specified"))?;
 
-    info!("Connecting to {host} at {remote}");
+    info!("Connecting to {hostname} at {remote:?}");
     // Create a connection
     let conn = endpoint
-        .connect(remote, host)?
+        .connect(remote, hostname.as_str())?
         .await
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     info!("Connected at {:?}", start.elapsed());
     // Add session to global sessions list
     let session = QuicTalkSession {
-        state: QuicTalkSessionState::Handshaking,
+        state: Mutex::new(QuicTalkSessionState::Handshaking),
         conn,
-        recv: None,
-        send: None,
+        recv: RwLock::new(None),
+        send: RwLock::new(None),
     };
     let sessions_list = global_states.sessions.clone();
     {
-
-        let lock = sessions_list.lock();
+        let lock = sessions_list.write();
         match lock {
             Err(_) => {
                 bail!("try locking global session list failed!")
-            },
+            }
             Ok(mut l) => {
-                (*l).push(session);
-                debug!("New session created. Currently {num} active sessions.", num = (*l).len() );
+                (*l).push(Arc::new(session));
+                debug!(
+                    "New session created. Currently {num} active sessions.",
+                    num = (*l).len()
+                );
             }
         }
     }

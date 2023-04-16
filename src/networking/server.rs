@@ -4,10 +4,11 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::{self, Path, PathBuf},
     str,
-    sync::Arc,
+    sync::{Arc},
     time::{Duration, Instant},
 };
 
+use tokio::sync::{RwLock, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, error, info};
 use tracing_futures::Instrument as _;
@@ -18,7 +19,11 @@ use crate::networking::session::{QuicTalkSession, QuicTalkSessionState};
 use crate::Opt;
 use crate::QuicTalkState;
 
-pub(crate) async fn server(options: Opt, global_state: QuicTalkState) -> Result<()> {
+pub(crate) async fn server(
+    localhost: SocketAddr,
+    options: Opt,
+    global_state: Arc<QuicTalkState>,
+) -> Result<()> {
     let (certs, key) = if let (Some(key_path), Some(cert_path)) = (&options.key, &options.cert) {
         let key = fs::read(key_path).context("failed to read private key")?;
         let key = if key_path.extension().map_or(false, |x| x == "der") {
@@ -53,7 +58,7 @@ pub(crate) async fn server(options: Opt, global_state: QuicTalkState) -> Result<
 
         (cert_chain, key)
     } else {
-        let dirs = directories_next::ProjectDirs::from("org", "quinn", "quinn-examples").unwrap();
+        let dirs = directories_next::ProjectDirs::from("dev", "merlyn", "quic-talk").unwrap();
         let path = dirs.data_local_dir();
         let cert_path = path.join("cert.der");
         let key_path = path.join("key.der");
@@ -102,10 +107,11 @@ pub(crate) async fn server(options: Opt, global_state: QuicTalkState) -> Result<
     //        bail!("root path does not exist");
     //    }
 
-    let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
+    let endpoint = quinn::Endpoint::server(server_config, localhost)?;
     info!("Listening on {}", endpoint.local_addr()?);
 
     while let Some(connecting) = endpoint.accept().await {
+        // TODO: check session status from list, and close inactive ones.
         // Accept connections from different remote socket
         debug!("New connection accepted");
         let connection = connecting.await?;
@@ -115,20 +121,20 @@ pub(crate) async fn server(options: Opt, global_state: QuicTalkState) -> Result<
         );
         // Construct a QuicTalkSessio
         let session = QuicTalkSession {
-            state: QuicTalkSessionState::Incoming,
+            state: Mutex::new(QuicTalkSessionState::Incoming),
             conn: connection,
-            recv: None,
-            send: None,
+            recv: RwLock::new(None),
+            send: RwLock::new(None),
         };
         let sessions_list = global_state.sessions.clone();
         {
-            let lock = sessions_list.lock();
+            let lock = sessions_list.write();
             match lock {
                 Err(_) => {
                     bail!("try locking global session list failed!")
                 }
                 Ok(mut l) => {
-                    (*l).push(session);
+                    (*l).push(Arc::new(session));
                     debug!(
                         "New session created. Currently {num} active sessions.",
                         num = (*l).len()

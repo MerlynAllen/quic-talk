@@ -1,7 +1,11 @@
 use anyhow::{anyhow, bail, Result};
 use quinn::{Connection, RecvStream, SendStream};
+//use std::cell::RefCell;
 use std::io::{Read, Write};
-use tracing::{debug, error, info, warn};
+use std::sync::Arc;
+//use std::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
+use tracing::{debug, error, info, warn, trace};
 pub(crate) enum QuicTalkSessionState {
     Incoming,
     Handshaking,
@@ -10,44 +14,63 @@ pub(crate) enum QuicTalkSessionState {
 }
 
 pub(crate) struct QuicTalkSession {
-    pub(crate) state: QuicTalkSessionState,
+    pub(crate) state: Mutex::<QuicTalkSessionState>,
     pub(crate) conn: Connection,
-    pub(crate) recv: Option<Box<RecvStream>>,
-    pub(crate) send: Option<Box<SendStream>>,
+    pub(crate) recv: RwLock<Option<Box<RecvStream>>>,
+    pub(crate) send: RwLock<Option<Box<SendStream>>>,
     // And some user info & connection info
 }
 impl QuicTalkSession {
     // Closes stream
-    pub(crate) async fn close(mut self) -> Result<()> {
+    pub(crate) async fn close(&self) -> Result<()> {
         // Gracefully close the stream
-        if let Some(mut send) = self.send {
+        let mut sender = self.send.write().await;
+        if let Some(ref mut send) = *sender {
             send.finish()
                 .await
                 .map_err(|e| anyhow!("failed to shutdown stream: {}", e))?;
             // Then delete from session
-            self.send = None;
+            *sender = None;
             debug!("Closed stream completely");
             Ok(())
         } else {
             bail!("stream not initialized")
         }
     }
-    // Opens bi-directional stream.
-    pub(crate) async fn open(mut self) -> Result<()> {
+    // Accepts bi-directional stream by server.
+    pub(crate) async fn accept(&self) -> Result<()> {
         let stream = self.conn.accept_bi().await;
         let (send, recv) = stream?; // Would generate error when peer closed. Error name: quinn::ConnectionError::ApplicationClosed
-        self.send = Some(Box::new(send));
-        self.recv = Some(Box::new(recv));
+
+        let mut sender = self.send.write().await;
+        let mut recver = self.recv.write().await;
+        *sender = Some(Box::new(send));
+        *recver = Some(Box::new(recv));
         debug!(
-            "Opened a new stream by {remote}",
+            "Accepted a new stream by {remote}",
             remote = self.conn.remote_address()
         );
         Ok(())
     }
+    // Opens bi-directional stream by client.
+    pub(crate) async fn open(&self) -> Result<()> {
+        let stream = self.conn.open_bi().await;
+        let (send, recv) = stream?;
+        let mut sender = self.send.write().await;
+        let mut recver = self.recv.write().await;
+        *sender = Some(Box::new(send));
+        *recver = Some(Box::new(recv));
+        debug!(
+            "Opened a new stream to {remote}",
+            remote = self.conn.remote_address()
+        );
+        Ok(())
+    }
+
     // Terminates connection (Only close sessions that are marked closed)
-    pub(crate) fn terminate(mut self) -> Result<()> {
+    pub(crate) async fn terminate(&self) -> Result<()> {
         // Should wait_idle and delete session from list after calling this.
-        match self.state {
+        match *self.state.lock().await {
             QuicTalkSessionState::Closed => {
                 // Terminate normally
                 self.conn.close(0u32.into(), b"done");
@@ -58,9 +81,10 @@ impl QuicTalkSession {
             }
             _ => {
                 // State is not closed
-                let should_close = self.recv.is_none() && self.send.is_none();
+                let should_close =
+                    self.recv.read().await.is_none() && self.send.read().await.is_none();
                 if should_close {
-                    self.state = QuicTalkSessionState::Closed;
+                    *self.state.lock().await = QuicTalkSessionState::Closed;
                     // Kills normally
                     self.conn.close(0u32.into(), b"done");
                     info!(
@@ -77,7 +101,7 @@ impl QuicTalkSession {
         Ok(())
     }
     // Kills a connection without checking!
-    pub(crate) fn kill(mut self) {
+    pub(crate) fn kill(&self) {
         self.conn.close(0u32.into(), b"done");
         warn!(
             "Killed connection to {remote} without checking!",
@@ -85,10 +109,11 @@ impl QuicTalkSession {
         );
     }
 
-    async fn write(self, buf: &[u8]) -> Result<usize> {
-        match self.state {
+    pub(crate) async fn write(&self, buf: &[u8]) -> Result<usize> {
+        match *self.state.lock().await {
             QuicTalkSessionState::Established => {
-                if let Some(mut send) = self.send {
+                let mut sender = self.send.write().await;
+                if let Some(ref mut send) = *sender {
                     send.write_all(buf)
                         .await
                         .map_err(|e| anyhow!("failed to send response: {}", e))?;
@@ -103,15 +128,17 @@ impl QuicTalkSession {
         Ok(buf.len())
     }
 
-    async fn read(self, buf: &mut [u8]) -> Result<(usize, Vec<u8>)> {
-        match self.state {
+    pub(crate) async fn read(&self) -> Result<(usize, Vec<u8>)> {
+        match *self.state.lock().await {
             QuicTalkSessionState::Established => {
-                if let Some(mut recv) = self.recv {
+                let mut recver = self.recv.write().await;
+                if let Some(ref mut recv) = *recver {
                     let req = recv
                         .read_to_end(64 * 1024)
                         .await
                         .map_err(|e| anyhow!("failed reading request: {}", e))?;
-                    Ok((buf.len(), req))
+                    trace!("Received {n} bytes", n = req.len());
+                    Ok((req.len(), req))
                 } else {
                     bail!("read when stream not initialized")
                 }
