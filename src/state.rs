@@ -1,9 +1,9 @@
-use crate::networking::session::QuicTalkSession;
+use crate::networking::session::Session;
 /// State Machine for QuicTalk
 use std::sync::{Arc, RwLock};
 #[derive(Clone)]
 pub(crate) struct QuicTalkState {
-    pub(crate) sessions: Arc<RwLock<Vec<Arc<QuicTalkSession>>>>,
+    pub(crate) sessions: Arc<RwLock<Vec<Arc<Session>>>>,
 }
 
 impl QuicTalkState {

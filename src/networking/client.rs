@@ -12,7 +12,7 @@ use clap::Parser;
 use tracing::{debug, error, info};
 
 use crate::networking::common;
-use crate::networking::session::{QuicTalkSession, QuicTalkSessionState};
+use crate::networking::session::{Session, SessionState};
 use crate::Opt;
 use crate::QuicTalkState;
 
@@ -80,8 +80,9 @@ pub(crate) async fn client(
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     info!("Connected at {:?}", start.elapsed());
     // Add session to global sessions list
-    let session = QuicTalkSession {
-        state: Mutex::new(QuicTalkSessionState::Handshaking),
+    let session = Session {
+        role: SessionRole::Client,
+        state: Mutex::new(SessionState::Ready),
         conn,
         recv: RwLock::new(None),
         send: RwLock::new(None),

@@ -51,3 +51,5 @@ tracing-subscriber = { version = "0.3.0", default-features = false, features = [
 tracing-futures = { version = "0.2.0", default-features = false, features = ["std-future"] }
 url = "2"
 config = "0.13.3"
+lazy_static = "1.4.0"
+signal-hook = "0.3.15"

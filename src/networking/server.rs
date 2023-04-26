@@ -15,7 +15,7 @@ use tracing_futures::Instrument as _;
 use url::Url;
 
 use crate::networking::common;
-use crate::networking::session::{QuicTalkSession, QuicTalkSessionState};
+use crate::networking::session::{Session, SessionState};
 use crate::Opt;
 use crate::QuicTalkState;
 
@@ -120,8 +120,9 @@ pub(crate) async fn server(
             remote = connection.remote_address()
         );
         // Construct a QuicTalkSessio
-        let session = QuicTalkSession {
-            state: Mutex::new(QuicTalkSessionState::Incoming),
+        let session = Session {
+            role: SessionRole::Server,
+            state: Mutex::new(SessionState::Ready),
             conn: connection,
             recv: RwLock::new(None),
             send: RwLock::new(None),

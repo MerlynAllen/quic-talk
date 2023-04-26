@@ -1,5 +1,14 @@
+// crate import
 mod networking;
 mod state;
+mod ui;
+mod message;
+
+
+use message::Message;
+use state::QuicTalkState;
+
+// external imports
 use clap::Parser;
 use std::{
     ascii, fs,
@@ -9,13 +18,17 @@ use std::{
     str,
     sync::Arc,
 };
+use std::sync::Condvar;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, error, info, info_span, trace, Level};
+use tracing::{debug, error, info, info_span, Level, trace};
 use tracing_futures::Instrument as _;
 use url::Url;
-
-use state::QuicTalkState;
+use lazy_static::lazy_static;
+use crate::networking::session::Session;
+use tokio::sync::{RwLock, Mutex};
+use std::sync::atomic::{AtomicBool};
+use signal_hook::consts::{SIGINT};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "server")]
@@ -61,8 +74,26 @@ struct Opt {
     trusted_ca: Option<PathBuf>,
 }
 
+//Global Variables
+lazy_static! {
+    static ref SESSIONS: Arc<RwLock<Vec<Session>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref MESSAGES: Arc<RwLock<Vec<Message>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref SHOULD_CLOSE: Arc<RwLock<bool>> = Arc::new(RwLock::new(false)); // Since this is a frequently accessed variable, we use a RwLock instead of a Mutex
+}
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // SIGINT handler
+    let mut signals = signal_hook::iterator::Signals::new(&[SIGINT])?;
+    let should_close = SHOULD_CLOSE.clone();
+    tokio::spawn(async move {
+        for _ in signals.forever() {
+            let mut should_close = should_close.write().await;
+            *should_close = true;
+        }
+    });
+
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -191,4 +222,16 @@ fn resolve_url(url: String) -> Result<(String, SocketAddr)> {
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
 
     Ok((host.to_string(), remote))
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn main() {
+        println!("Hello, world!");
+    }
+    #[tokio::test]
+    async fn stream_test() {
+        
+    }
 }
