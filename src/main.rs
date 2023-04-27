@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_max_level(Level::DEBUG)
+            // .with_max_level(Level::DEBUG)
             .finish(),
     )
         .unwrap();
@@ -178,9 +178,10 @@ async fn main() -> Result<()> {
         Ok(())
     });
 
-    connect(hostname, remote.port(), opt.clone()).await?;
+    let client = tokio::spawn(connect(hostname, remote.port(), opt.clone()));
 
     server.await??;
+    client.await??;
     dispatcher.await??;
     console.await??;
     Ok(())
