@@ -18,6 +18,8 @@ use std::{
     str,
     sync::Arc,
 };
+use std::io::Write;
+use std::process::exit;
 use std::sync::Condvar;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -25,13 +27,17 @@ use tracing::{debug, error, info, info_span, Level, trace};
 use tracing_futures::Instrument as _;
 use url::Url;
 use lazy_static::lazy_static;
-use crate::networking::session::Session;
+use networking::{session::Session};
 use tokio::sync::{RwLock, Mutex};
 use std::sync::atomic::{AtomicBool};
+use tokio::task::JoinHandle;
 use signal_hook::consts::{SIGINT};
+use crate::networking::{connect, server};
+use crate::networking::session::SessionState;
+
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "server")]
+#[command(name = "quic-talk", version = "0.1.0", about = "A simple QUIC chat application")]
 struct Opt {
     /// file to log TLS keys to for debugging
     #[arg(long)]
@@ -76,7 +82,7 @@ struct Opt {
 
 //Global Variables
 lazy_static! {
-    static ref SESSIONS: Arc<RwLock<Vec<Session>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref SESSIONS: Arc<RwLock<Vec<Arc<Session>>>> = Arc::new(RwLock::new(Vec::new()));
     static ref MESSAGES: Arc<RwLock<Vec<Message>>> = Arc::new(RwLock::new(Vec::new()));
     static ref SHOULD_CLOSE: Arc<RwLock<bool>> = Arc::new(RwLock::new(false)); // Since this is a frequently accessed variable, we use a RwLock instead of a Mutex
 }
@@ -88,10 +94,19 @@ async fn main() -> Result<()> {
     let mut signals = signal_hook::iterator::Signals::new(&[SIGINT])?;
     let should_close = SHOULD_CLOSE.clone();
     tokio::spawn(async move {
+        let mut ctrl_c_count = 0usize;
         for _ in signals.forever() {
+            ctrl_c_count += 1;
+            if ctrl_c_count >= 2 {
+                break;
+            }
             let mut should_close = should_close.write().await;
             *should_close = true;
+            info!("Caught SIGINT, closing...");
+
         }
+        info!("Force exiting...");
+        exit(1);
     });
 
     tracing::subscriber::set_global_default(
@@ -100,102 +115,75 @@ async fn main() -> Result<()> {
             .with_max_level(Level::DEBUG)
             .finish(),
     )
-    .unwrap();
+        .unwrap();
     let opt = Opt::parse();
-    let global_state = Arc::new(QuicTalkState::new());
-    let (global_state_c, global_state_s) = (global_state.clone(), global_state.clone());
-    // Temporarily write like this (for testing),
-    // later write a new test module.
-    //    let code = match opt.mode.as_str() {
-    //        "server" => {
-    //            if let Err(e) = networking::server(opt, global_state).await {
-    //                eprintln!("ERROR: {e}");
-    //                1
-    //            } else {
-    //                0
-    //            }
-    //        }
-    //        "client" => {
-    //            if let Err(e) = networking::client(opt, global_state).await {
-    //                eprintln!("ERROR: {e}");
-    //                1
-    //            } else {
-    //                0
-    //            }
-    //        }
-    //        _ => {
-    //            panic!("\"{}\" mode is not a valid mode!", opt.mode);
-    //        }
-    //    };
 
-    match opt.mode.as_str() {
-        "server" => {
-            let localhost = opt.listen;
-            let s = networking::server(localhost, opt.clone(), global_state.clone());
-            let s_process = tokio::spawn(async move {
-                match s.await {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        error!("Error occurred when executing server: {e}");
-                        1
-                    }
-                }
-            });
-            //            s_process.await;
-            let server = tokio::spawn(async move {
-                let sessions = global_state_s.sessions.clone();
-                while sessions.read().unwrap().len() == 0 {} // Block until session exists
-                let client_stream = match sessions.write() {
-                    Ok(v) => v[0].clone(),
-                    Err(e) => {
-                        bail!("get mutex lock failed");
-                    }
-                };
-                client_stream.open().await?;
-                debug!("Trying to read!");
-                let (nbytes, buf) = client_stream.read().await?;
-                println!("Client said:{}", String::from_utf8(Vec::from(buf))?);
-                client_stream.terminate().await;
-                Ok(())
-            });
-            server.await?
-        }
-        "client" => {
-            let (hostname, remote) = resolve_url(opt.remote.to_string())?;
-            let c = networking::client(hostname, remote.port(), opt.clone(), global_state.clone());
-            let c_process = tokio::spawn(async move {
-                match c.await {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        error!("Error occurred when executing client: {e}");
-                        1
-                    }
-                }
-            });
-            c_process.await;
-            let client = tokio::spawn(async move {
-                let sessions = global_state_c.sessions.clone();
-                let client_stream = match sessions.write() {
-                    Ok(v) => v[0].clone(),
-                    Err(e) => {
-                        bail!("get mutex lock failed");
-                    }
-                };
+    // create a server task
+    // TODO check config for server
+    let server = server(opt.listen, opt.clone()).await?;
 
-                client_stream.open().await;
-                debug!("Trying to write!");
-                client_stream.write("Hello!".as_bytes()).await;
 
-                debug!("Written");
-                client_stream.terminate().await;
-                Ok(())
-            });
-            client.await?
+    // TODO currently read target from config
+    let (hostname, remote) = match resolve_url(opt.remote.clone()) {
+        Ok(target) => target,
+        Err(e) => {
+            error!("Failed to resolve target: {}", e);
+            bail!("invalid URL");
         }
-        _ => {
-            bail!("invalid mode name");
+    };
+
+
+    let dispatcher: JoinHandle<Result<()>> = tokio::spawn(async move {
+        loop {
+            // TODO check config for client
+            if *SHOULD_CLOSE.clone().read().await {
+                break;
+            }
+            for message in MESSAGES.write().await.drain(..) {
+                let message = message.as_string().ok_or(
+                    anyhow!("invalid message bytes")
+                )?;
+                println!(">>{}", message);
+            }
+
         }
-    }
+        Ok(())
+    });
+
+
+    let console: JoinHandle<Result<()>> = tokio::spawn(async move {
+        debug!("Starting console");
+        loop {
+            // TODO check config for client
+            if *SHOULD_CLOSE.clone().read().await {
+                break;
+            }
+            let mut input = String::new();
+            print!("<<");
+            io::stdout().flush().unwrap();
+            io::stdin().read_line(&mut input).unwrap();
+            input.strip_suffix("\n").unwrap_or(&input);
+            let message = Message::from_string(input);
+            //你他妈倒是走网络啊
+            if SESSIONS.read().await.len() == 0 {
+                debug!("No session available, pushing message to queue");
+                continue;
+            } else {
+                debug!("Session available, pushing message to session");
+                SESSIONS.read().await[0].send_message(message).await?;
+            }
+            debug!("Message pushed to queue");
+            debug!("Message queue length: {}", MESSAGES.read().await.len());
+        }
+        Ok(())
+    });
+
+    connect(hostname, remote.port(), opt.clone()).await?;
+
+    server.await??;
+    dispatcher.await??;
+    console.await??;
+    Ok(())
 }
 
 fn resolve_url(url: String) -> Result<(String, SocketAddr)> {
@@ -230,8 +218,7 @@ mod test {
     fn main() {
         println!("Hello, world!");
     }
+
     #[tokio::test]
-    async fn stream_test() {
-        
-    }
+    async fn stream_test() {}
 }

@@ -13,14 +13,13 @@ use tracing::{debug, error, info};
 
 use crate::networking::common;
 use crate::networking::session::{Session, SessionState};
-use crate::Opt;
+use crate::{Opt, SESSIONS};
 use crate::QuicTalkState;
 
-pub(crate) async fn client(
+pub(crate) async fn connect(
     hostname: String,
     port: u16,
     options: Opt,
-    global_states: Arc<QuicTalkState>,
 ) -> Result<()> {
     let remote = format!("{hostname}:{port}")
         .to_socket_addrs()?
@@ -59,6 +58,10 @@ pub(crate) async fn client(
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
     common::enable_mtud_if_supported(&mut client_config);
+    let transport_config = Arc::get_mut(&mut client_config.transport).unwrap();
+    // Use long connections
+    // TODO - Set max_idle_timeout to 0 to disable idle timeout JUST FOT TESTING
+    transport_config.max_idle_timeout(None);
 
     let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?; // Local listening port
     endpoint.set_default_client_config(client_config);
@@ -80,29 +83,13 @@ pub(crate) async fn client(
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     info!("Connected at {:?}", start.elapsed());
     // Add session to global sessions list
-    let session = Session {
-        role: SessionRole::Client,
-        state: Mutex::new(SessionState::Ready),
-        conn,
-        recv: RwLock::new(None),
-        send: RwLock::new(None),
-    };
-    let sessions_list = global_states.sessions.clone();
-    {
-        let lock = sessions_list.write();
-        match lock {
-            Err(_) => {
-                bail!("try locking global session list failed!")
-            }
-            Ok(mut l) => {
-                (*l).push(Arc::new(session));
-                debug!(
-                    "New session created. Currently {num} active sessions.",
-                    num = (*l).len()
-                );
-            }
-        }
-    }
+    let session = Session::new(conn).await;
+    let mut sessions_list = SESSIONS.write().await;
+    sessions_list.push(session);
+    debug!(
+        "New session created. Currently {num} active sessions.",
+        num = sessions_list.len()
+    );
     Ok(())
 }
 //

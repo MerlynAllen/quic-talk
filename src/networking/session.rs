@@ -3,7 +3,6 @@ use quinn::{Connection, RecvStream, SendStream};
 //use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use async_std::prelude::FutureExt;
 use tokio::io::AsyncReadExt;
 //use std::sync::RwLock;
 use crate::{
@@ -14,10 +13,11 @@ use crate::{
 };
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
+use tokio::time;
 use tracing::{debug, error, info, trace, warn};
 use tracing::field::debug;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionState {
     Ready,
     // QUIC connection established
@@ -82,23 +82,35 @@ impl Session {
             // Then spawn a listener
             let this = listener_this;
             let listener: JoinHandle<Result<()>> = tokio::spawn(async move { // `this` moved to subprocess
-                let this = this.clone();
-
-                // Check exit condition
+                // Wait for session state to become Established
                 loop {
-                    if *SHOULD_CLOSE.clone().read().await {
-                        debug!("Closing server task.");
+                    // Check exit condition
+                    debug!("Checking session state");
+                    if *this.state.read().await == SessionState::Closed {
+                        break;
+                    }
+                    // Wait for session state to become Established
+                    if *this.state.read().await == SessionState::Established {
+                        break;
+                    }
+                    debug!("Waiting for session state to become Established");
+                    time::sleep(time::Duration::from_millis(100)).await;
+                }
+                loop {
+                    // Check exit condition
+                    if *this.state.read().await == SessionState::Closed {
                         break;
                     }
 
                     // Wait for new stream
-                    match this.accept().await {
+                    match this.clone().accept().await {
                         Ok(task) => {
                             receive_stream_handlers_for_listener.clone().lock().await.push(task);
                         }
                         Err(e) => {
                             error!("Failed to accept new stream: {}", e);
-                            continue;
+                            // QUIC Idle Timed Out
+                            break;
                         }
                     }; // accept opens a new stream and spawns a new task to handle it.
                 }
@@ -111,9 +123,8 @@ impl Session {
             let receiver: JoinHandle<Result<()>> = tokio::spawn(async move {
                 // Get message from listener. Check if the message sending is done.
                 loop {
-                    // Should check if the program is closing
-                    if *SHOULD_CLOSE.clone().read().await {
-                        debug!("Closing stream pool task.");
+                    // Check exit condition
+                    if *this.state.read().await == SessionState::Closed {
                         break;
                     }
                     // Enumerate the list and push to the message pool
@@ -147,8 +158,7 @@ impl Session {
                 // Loop and send messages from `self.send` to peer
                 loop {
                     // Check exit condition
-                    if *SHOULD_CLOSE.clone().read().await {
-                        debug!("Closing receiver task.");
+                    if *this.state.read().await == SessionState::Closed {
                         break;
                     }
                     // TODO should open a new task
@@ -156,7 +166,11 @@ impl Session {
                     let mut send_list = this.send.write().await;
                     // If there are messages to be sent
                     let msg = match send_list.pop() {
-                        Some(msg) => msg,
+                        Some(msg) => {
+                            debug!("Got message from send queue");
+                            debug!("Queue length: {}", send_list.len());
+                            msg
+                        },
                         None => {
                             // No messages to be sent, wait for new messages.
                             continue;
@@ -185,9 +199,8 @@ impl Session {
             let this = sender_this;
             let sender: JoinHandle<Result<()>> = tokio::spawn(async move {
                 loop {
-                    // First check exit condition
-                    if *SHOULD_CLOSE.clone().read().await {
-                        debug!("Closing sender task.");
+                    // Check exit condition
+                    if *this.state.read().await == SessionState::Closed {
                         break;
                     }
                     // Enumerate the list and wait
@@ -229,11 +242,11 @@ impl Session {
         Ok(())
     }
 
-    async fn set_state(&self, state: SessionState) {
+    pub(crate) async fn set_state(&self, state: SessionState) {
         *self.state.write().await = state;
     }
 
-    async fn get_state(&self) -> SessionState {
+    pub(crate) async fn get_state(&self) -> SessionState {
         *self.state.read().await
     }
 
@@ -242,35 +255,35 @@ impl Session {
     /// The task should expect a new message or error.
     /// Then reply with a message.
     /// Then closes the stream.
-    async fn accept(&self) -> Result<tokio::task::JoinHandle<Result<Message>>> {
-        let stream = self.conn.accept_bi().await; // This would block
-        let (mut send, mut recv) = stream?;
+    async fn accept(self: Arc<Self>) -> Result<tokio::task::JoinHandle<Result<Message>>> {
+        debug!("Waiting for new stream...");
+        let stream = self.conn.accept_bi().await?; // This would block?
+        let (mut send, mut recv) = stream;
         // Would generate error when peer closed. Error name: quinn::ConnectionError::ApplicationClosed
         debug!(
-            "Accepted a new stream by {remote}",
+            "Accepted a new stream opened by {remote}",
             remote = self.conn.remote_address()
         );
-        let recv_list = self.recv.clone();
         let task = tokio::spawn(async move {
             // First, read data from stream
             let mut buf = [0u8; 1024];
             let mut msg = Vec::new();
+            debug!("Reading data from stream...");
             loop {
                 // Check exit condition
-
-                if *SHOULD_CLOSE.clone().read().await {
-                    debug!("Closing accept task.");
+                if *self.state.read().await == SessionState::Closed {
                     break;
                 }
 
                 let n = recv.read(&mut buf).await?;
+                debug!("Read {:?} bytes from stream", n);
                 match n {
-                    Some(0) => break,
+                    Some(0) | None => break,
                     Some(n) =>
                         msg.extend_from_slice(&buf[..n]),
-                    None => bail!("stream closed"),
                 }
             }
+            debug!("Read data from stream: {:?}", msg);
             // Then, parse data
             let msg = Message::from_bytes(Vec::from(buf));
             // recv do not need to close, it will be closed by the sender.
@@ -291,6 +304,7 @@ impl Session {
     async fn send(self: Arc<Self>, msg: Message, ) -> Result<JoinHandle<Result<()>>> {
         // If there are messages to send, create a new stream and send it.
         let (mut send, mut recv) = self.conn.open_bi().await?;
+        debug!("Opened a new stream to send message");
         let task: JoinHandle<Result<()>> = tokio::spawn(async move {
             let write_buf = match msg.as_bytes() {
                 Some(buf) => buf,
@@ -298,7 +312,11 @@ impl Session {
                     bail!("string convert to bytes should not fail");
                 }
             };
+            debug!("Sending message: {:?}", msg.as_string());
             send.write_all(&write_buf).await?;
+            send.finish().await?;
+            debug!("{} bytes sent", write_buf.len());
+            debug!("Waiting for peer to reply echo");
             // Wait for peer to reply echo
             let mut read_buf = Vec::new();
             loop {
@@ -309,14 +327,13 @@ impl Session {
                     Some(n) => read_buf.extend_from_slice(&buf[..n]),
                 }
             }
+            debug!("Received reply: {:?}", read_buf);
             // TODO Deserialize message
             // Currently treat all messages as `String`
             let reply = String::from_utf8(read_buf)?;
             match reply.as_str() {
                 "OK" => {
-                    // Terminate safely.
                     debug!("Stream transferred data safely.");
-                    send.finish().await?;
                 }
                 _ => {
                     error!("Failed to receive echo. Putting back to queue.");
@@ -328,5 +345,14 @@ impl Session {
             Ok(())
         });
         Ok(task)
+    }
+
+
+    /// Interface for other modules to send message to peer.
+    pub(crate) async fn send_message(&self, msg: Message) -> Result<()> {
+        // Push to send queue
+        let mut send_list = self.send.write().await;
+        send_list.push(msg);
+        Ok(())
     }
 }

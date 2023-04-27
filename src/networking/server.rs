@@ -4,26 +4,23 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::{self, Path, PathBuf},
     str,
-    sync::{Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use tokio::sync::{RwLock, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 use tracing_futures::Instrument as _;
 use url::Url;
 
 use crate::networking::common;
 use crate::networking::session::{Session, SessionState};
-use crate::Opt;
 use crate::QuicTalkState;
+use crate::{Opt, SESSIONS, SHOULD_CLOSE};
 
-pub(crate) async fn server(
-    localhost: SocketAddr,
-    options: Opt,
-    global_state: Arc<QuicTalkState>,
-) -> Result<()> {
+pub(crate) async fn server(localhost: SocketAddr, options: Opt) -> Result<JoinHandle<Result<()>>> {
     let (certs, key) = if let (Some(key_path), Some(cert_path)) = (&options.key, &options.cert) {
         let key = fs::read(key_path).context("failed to read private key")?;
         let key = if key_path.extension().map_or(false, |x| x == "der") {
@@ -96,12 +93,13 @@ pub(crate) async fn server(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
+    // TODO - Set max_idle_timeout to 0 to disable idle timeout JUST FOT TESTING
+    transport_config.max_idle_timeout(None);
     //    #[cfg(any(windows, os = "linux"))]
     //    transport_config.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
     if options.stateless_retry {
         server_config.use_retry(true);
     }
-
     //    let root = Arc::<Path>::from(options.root.clone());
     //    if !root.exists() {
     //        bail!("root path does not exist");
@@ -109,40 +107,33 @@ pub(crate) async fn server(
 
     let endpoint = quinn::Endpoint::server(server_config, localhost)?;
     info!("Listening on {}", endpoint.local_addr()?);
-
-    while let Some(connecting) = endpoint.accept().await {
-        // TODO: check session status from list, and close inactive ones.
-        // Accept connections from different remote socket
-        debug!("New connection accepted");
-        let connection = connecting.await?;
-        info!(
-            "Connection incoming from {remote:?}",
-            remote = connection.remote_address()
-        );
-        // Construct a QuicTalkSessio
-        let session = Session {
-            role: SessionRole::Server,
-            state: Mutex::new(SessionState::Ready),
-            conn: connection,
-            recv: RwLock::new(None),
-            send: RwLock::new(None),
-        };
-        let sessions_list = global_state.sessions.clone();
-        {
-            let lock = sessions_list.write();
-            match lock {
-                Err(_) => {
-                    bail!("try locking global session list failed!")
+    let task: JoinHandle<Result<()>> = tokio::spawn(async move {
+        while let Some(connecting) = endpoint.accept().await {
+            if *SHOULD_CLOSE.clone().read().await {
+                debug!("Closing server task.");
+                for session in SESSIONS.write().await.iter_mut() {
+                    // Close all sessions
+                    session.set_state(SessionState::Closed).await;
                 }
-                Ok(mut l) => {
-                    (*l).push(Arc::new(session));
-                    debug!(
-                        "New session created. Currently {num} active sessions.",
-                        num = (*l).len()
-                    );
-                }
+                break;
             }
+            // Accept connections from different remote socket
+            debug!("New connection accepted");
+            let connection = connecting.await?;
+            info!(
+                "Connection incoming from {remote:?}",
+                remote = connection.remote_address()
+            );
+            let session = Session::new(connection).await;
+            let mut sessions_list = SESSIONS.write().await;
+            sessions_list.push(session);
+            debug!(
+                "New session created. Currently {num} active sessions.",
+                num = sessions_list.len()
+            );
         }
-    }
-    Ok(())
+        Ok(())
+    });
+
+    Ok(task)
 }
