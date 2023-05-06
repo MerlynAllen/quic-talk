@@ -1,6 +1,8 @@
+#[derive(Debug, Clone)]
 pub(crate) enum Message {
     String(String),
     Bytes(Vec<u8>),
+
 }
 impl Message {
     pub(crate) fn from_string(text: String) -> Self {
@@ -21,7 +23,6 @@ impl Message {
     }
     // This do not consume the message
     pub(crate) fn as_bytes(&self) -> Option<Vec<u8>> {
-        matches!(self, Self::Bytes(_));
         match self {
             Self::String(text) => {
                 // Convert text to binary

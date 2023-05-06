@@ -12,7 +12,6 @@ use state::QuicTalkState;
 use clap::Parser;
 use std::{
     ascii, fs,
-    io::{self},
     net::{SocketAddr, ToSocketAddrs},
     path::{self, Path, PathBuf},
     str,
@@ -29,9 +28,11 @@ use url::Url;
 use lazy_static::lazy_static;
 use networking::{session::Session};
 use tokio::sync::{RwLock, Mutex};
+use tokio::io;
 use std::sync::atomic::{AtomicBool};
 use tokio::task::JoinHandle;
 use signal_hook::consts::{SIGINT};
+use tokio::io::AsyncWriteExt;
 use crate::networking::{connect, server};
 use crate::networking::session::SessionState;
 
@@ -56,7 +57,7 @@ struct Opt {
     stateless_retry: bool,
 
     /// Address to listen on (Server only)
-    #[arg(long, default_value = "[::1]:4433")]
+    #[arg(long, default_value = "[::1]:12345")]
     listen: SocketAddr,
 
     /// Mode (Server / Client)
@@ -64,7 +65,7 @@ struct Opt {
     mode: String,
 
     /// Address to connect, in URL form (Client only)
-    #[arg(long, default_value = "[::1]::4433")]
+    #[arg(long, default_value = "https://localhost:12345")]
     remote: String,
 
     /// Host name to overwrite (Client only), optional.
@@ -83,8 +84,9 @@ struct Opt {
 //Global Variables
 lazy_static! {
     static ref SESSIONS: Arc<RwLock<Vec<Arc<Session>>>> = Arc::new(RwLock::new(Vec::new()));
-    static ref MESSAGES: Arc<RwLock<Vec<Message>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref MESSAGES: Arc<RwLock<Vec<Message>>> = Arc::new(RwLock::new(Vec::new())); // Messages to be shown in the UI
     static ref SHOULD_CLOSE: Arc<RwLock<bool>> = Arc::new(RwLock::new(false)); // Since this is a frequently accessed variable, we use a RwLock instead of a Mutex
+    static ref STDIN_BUFFER: Arc<RwLock<Vec<u8>>> = Arc::new(RwLock::new(Vec::new()));
 }
 
 
@@ -103,7 +105,6 @@ async fn main() -> Result<()> {
             let mut should_close = should_close.write().await;
             *should_close = true;
             info!("Caught SIGINT, closing...");
-
         }
         info!("Force exiting...");
         exit(1);
@@ -120,7 +121,11 @@ async fn main() -> Result<()> {
 
     // create a server task
     // TODO check config for server
-    let server = server(opt.listen, opt.clone()).await?;
+
+    let server = if opt.mode == "server" {
+        server(opt.listen, opt.clone()).await?} else {
+        tokio::spawn(async move { Ok(()) })
+    };
 
 
     // TODO currently read target from config
@@ -139,51 +144,61 @@ async fn main() -> Result<()> {
             if *SHOULD_CLOSE.clone().read().await {
                 break;
             }
-            for message in MESSAGES.write().await.drain(..) {
-                let message = message.as_string().ok_or(
-                    anyhow!("invalid message bytes")
-                )?;
-                println!(">>{}", message);
-            }
-
-        }
-        Ok(())
-    });
-
-
-    let console: JoinHandle<Result<()>> = tokio::spawn(async move {
-        debug!("Starting console");
-        loop {
-            // TODO check config for client
-            if *SHOULD_CLOSE.clone().read().await {
-                break;
-            }
-            let mut input = String::new();
-            print!("<<");
-            io::stdout().flush().unwrap();
-            io::stdin().read_line(&mut input).unwrap();
-            input.strip_suffix("\n").unwrap_or(&input);
-            let message = Message::from_string(input);
-            //你他妈倒是走网络啊
-            if SESSIONS.read().await.len() == 0 {
-                debug!("No session available, pushing message to queue");
+            let mut messages_queue = MESSAGES.write().await;
+            let messages = messages_queue.drain(..);
+            if messages.len() == 0 {
                 continue;
-            } else {
-                debug!("Session available, pushing message to session");
-                SESSIONS.read().await[0].send_message(message).await?;
             }
-            debug!("Message pushed to queue");
-            debug!("Message queue length: {}", MESSAGES.read().await.len());
+            debug!("MESSAGE queue have {len} messages.", len = messages.len());
+
+            io::stdout().flush().await?; // will block when stdin is reading
+            for message in messages {
+                debug!("Got message {msg:?} from MESSAGES queue.",
+                    msg = message);
+                println!(">>{}", message.as_string().ok_or(anyhow!("Failed to convert message to string"))?);
+            }
         }
         Ok(())
     });
 
-    let client = tokio::spawn(connect(hostname, remote.port(), opt.clone()));
+    let console = ui::UI::console()?;
+    //
+    // let console: JoinHandle<Result<()>> = tokio::spawn(async move {
+    //     debug!("Starting console");
+    //     loop {
+    //         // TODO check config for client
+    //         if *SHOULD_CLOSE.clone().read().await {
+    //             break;
+    //         }
+    //         let mut input = String::new();
+    //         print!("<<");
+    //         io::stdout().flush().unwrap();
+    //         io::stdin().read_line(&mut input).unwrap();
+    //         input.strip_suffix("\n").unwrap_or(&input);
+    //         let message = Message::from_string(input);
+    //         if SESSIONS.read().await.len() == 0 {
+    //             debug!("No session available, pushing message to queue");
+    //             continue;
+    //         } else {
+    //             debug!("Session available, pushing message to session");
+    //             SESSIONS.read().await[0].send_message(message).await?;
+    //         }
+    //         debug!("Message pushed to queue");
+    //         debug!("Message queue length: {}", MESSAGES.read().await.len());
+    //     }
+    //     Ok(())
+    // });
 
+    let client = if opt.mode == "client" {
+        tokio::spawn(connect(hostname, remote.port(), opt.clone()))
+    } else {
+        tokio::spawn(async move { Ok(()) })
+    };
+
+    console.await??;
     server.await??;
     client.await??;
     dispatcher.await??;
-    console.await??;
     Ok(())
 }
 

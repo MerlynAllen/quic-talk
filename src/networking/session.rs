@@ -161,7 +161,6 @@ impl Session {
                     if *this.state.read().await == SessionState::Closed {
                         break;
                     }
-                    // TODO should open a new task
                     let this = this.clone();
                     let mut send_list = this.send.write().await;
                     // If there are messages to be sent
@@ -178,7 +177,7 @@ impl Session {
                     };
                     // Send the message
                     let this = this.clone();
-                    match this.send(msg).await {
+                    match this.send(msg).await { // Return a new task
                         Ok(task) => {
                             // Message stream scheduled to be sent
                             send_stream_handlers_for_sender.lock().await.push(task);
