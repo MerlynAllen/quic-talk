@@ -35,7 +35,7 @@ rustls = { version = "0.21.0", default-features = false, features = ["quic"], op
 thiserror = "1.0.21"
 tracing = "0.1.10"
 tokio = { version = "1.13.0", features = ["full"] }
-udp = { package = "quinn-udp", path = "./quinn/quinn-udp", version = "0.3", default-features = false }
+udp = { package = "quinn-udp", path = "./quinn/quinn-udp", version = "0.4", default-features = false }
 webpki = { version = "0.22", default-features = false, optional = true }
 quinn = { package = "quinn", path = "./quinn/quinn", version = "0.10"}
 #[dev-dependencies]
