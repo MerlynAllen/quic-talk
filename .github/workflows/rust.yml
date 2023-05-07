@@ -21,6 +21,8 @@ jobs:
       run: cargo fetch
     - name: Install Cargo Cross
       run: cargo install cross --git https://github.com/cross-rs/cross
+    - name: Install docker
+      run: curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
     - name: Build
       run: cross build --release --target aarch64-apple-darwin x86_64-unknown-linux-gnu
     - name: Create Release
