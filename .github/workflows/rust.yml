@@ -24,7 +24,7 @@ jobs:
     - name: setup-docker
       uses: docker-practice/actions-setup-docker@1.0.11
     - name: Build
-      run: cross build --release --target aarch64-apple-darwin x86_64-unknown-linux-gnu
+      run: cross build --release --target aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
     - name: Create Release
       id: create_release
       uses: actions/create-release@v1
