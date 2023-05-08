@@ -1,35 +1,45 @@
-#[derive(Debug, Clone)]
-pub(crate) enum Message {
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, Duration};
+use crate::user::User;
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct Message {
+    pub(crate) time: SystemTime,
+    pub(crate) user: User,
+    pub(crate) data: Body,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) enum Body {
     String(String),
     Bytes(Vec<u8>),
-
+    File(File),
+    Auth,
+    Control(Control),
 }
-impl Message {
-    pub(crate) fn from_string(text: String) -> Self {
-        Self::String(text)
-    }
-    pub(crate) fn from_bytes(data: Vec<u8>) -> Self {
-        Self::Bytes(data)
-    }
-    // This do not consume the message
-    pub(crate) fn as_string(&self) -> Option<String> {
-        match self {
-            Self::String(text) => Some(text.clone()),
-            Self::Bytes(bin) => {
-                // Convert binary to text
-                String::from_utf8(bin.clone()).ok()
-            },
-        }
-    }
-    // This do not consume the message
-    pub(crate) fn as_bytes(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::String(text) => {
-                // Convert text to binary
-                Some(text.clone().into_bytes())
-            },
-            Self::Bytes(bin) => Some(bin.clone()),
-        }
-    }
 
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct File {
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) data: Vec<u8>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) enum Control {
+    CloseByPeer,
+    Acknowledge,
+    RetransmissionRequest,
+    Verified,
+    ConnectionDenied,
+}
+
+
+// pub(crate) enum Message {
+//     String(String),
+//     Bytes(Vec<u8>),
+//
+// }
+impl Message {}

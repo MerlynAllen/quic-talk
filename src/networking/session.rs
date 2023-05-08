@@ -10,12 +10,18 @@ use crate::{
     networking::Stream,
     SHOULD_CLOSE,
     MESSAGES,
+    ME,
+    User,
+    message::{Control, Body},
 };
 use tokio::sync::{Mutex, RwLock};
+use std::cell::RefCell;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
-use tracing::field::debug;
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+use crate::networking::{MAX_AUTH_READ_LEN, MAX_STREAM_LEN};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionState {
@@ -25,18 +31,23 @@ pub(crate) enum SessionState {
     // Sending / receiving auth data
     Established,
     // Authentication successfully completed
-    Closed,         // QUIC connection closed
+    Closed,
+    // QUIC connection closed
+    Terminated,     // Session terminated
 }
 
 pub(crate) struct Session {
     pub(crate) state: RwLock<SessionState>,
     pub(crate) conn: Connection,
-    handler: Arc<RwLock<Option<tokio::task::JoinHandle<Result<()>>>>>,
+    handler: Arc<RwLock<Option<JoinHandle<Result<()>>>>>,
     streams: Arc<RwLock<Vec<Stream>>>,
     send: Arc<RwLock<Vec<Message>>>,
     // Messages to be sent
-    recv: Arc<RwLock<Vec<Message>>>, // Messages received
+    recv: Arc<RwLock<Vec<Message>>>,
+    // Messages received
     // And some user info & connection info
+    peer: RwLock<Option<User>>,
+    me: Option<User>,
 }
 
 
@@ -45,7 +56,8 @@ pub(crate) struct Session {
 
 impl Session {
     // Spawn a new task to handle session events, returns JoinHandle
-    pub(crate) async fn new(conn: Connection) -> Arc<Self> {
+    pub(crate) async fn new(conn: Connection) -> Result<Arc<Self>> {
+        let me = ME.read().await.clone();
         let this = Arc::new(Self {
             state: RwLock::new(SessionState::Ready),
             conn,
@@ -53,6 +65,8 @@ impl Session {
             streams: Arc::new(RwLock::new(Vec::new())),
             send: Arc::new(RwLock::new(Vec::new())),
             recv: Arc::new(RwLock::new(Vec::new())),
+            peer: RwLock::new(None),
+            me,
         });
         let ret = this.clone();
         let handler = this.handler.clone();
@@ -63,29 +77,33 @@ impl Session {
             let dispatcher_this = this.clone();
             let receiver_this = this.clone();
             let sender_this = this.clone();
-
+            let collector_this = this.clone();
 
             // First authenticate
             let this = main_this;
+            debug!("Session created. Authenticating...");
             this.set_state(SessionState::Authenticating).await;
-            this.auth().await?; // if error, throw and return.
-            this.verify().await?; // if error, throw and return.
+            let auth_this = this.clone();
+            let auth_task = tokio::spawn(auth_this.auth());
+            let verify_this = this.clone();
+            let verify_task = tokio::spawn(verify_this.verify());
+
+            // Wait for authentication to complete
+            auth_task.await??;
+            verify_task.await??;
             // Established
             this.set_state(SessionState::Established).await;
-            let receive_stream_handlers: Arc<Mutex<Vec<JoinHandle<Result<Message>>>>> = Arc::new(Mutex::new(Vec::new()));
-            let receive_stream_handlers_for_listener = receive_stream_handlers.clone();
+            let receive_stream_handles: Arc<Mutex<Vec<JoinHandle<Result<Message>>>>> = Arc::new(Mutex::new(Vec::new()));
+            let receive_stream_handles_for_listener = receive_stream_handles.clone();
 
-            let send_stream_handlers: Arc<Mutex<Vec<JoinHandle<Result<()>>>>> = Arc::new(Mutex::new(Vec::new()));
-            let send_stream_handlers_for_sender = send_stream_handlers.clone();
-
+            let send_stream_handles: Arc<Mutex<Vec<JoinHandle<Result<()>>>>> = Arc::new(Mutex::new(Vec::new()));
+            let send_stream_handles_for_sender = send_stream_handles.clone();
 
             // Then spawn a listener
             let this = listener_this;
-            let listener: JoinHandle<Result<()>> = tokio::spawn(async move { // `this` moved to subprocess
+            let _listener: JoinHandle<Result<()>> = tokio::spawn(async move { // `this` moved to subprocess
                 // Wait for session state to become Established
                 loop {
-                    // Check exit condition
-                    debug!("Checking session state");
                     if *this.state.read().await == SessionState::Closed {
                         break;
                     }
@@ -94,18 +112,18 @@ impl Session {
                         break;
                     }
                     debug!("Waiting for session state to become Established");
-                    time::sleep(time::Duration::from_millis(100)).await;
                 }
                 loop {
                     // Check exit condition
                     if *this.state.read().await == SessionState::Closed {
+                        debug!("Session closed. Exiting listener.");
                         break;
                     }
 
                     // Wait for new stream
                     match this.clone().accept().await {
                         Ok(task) => {
-                            receive_stream_handlers_for_listener.clone().lock().await.push(task);
+                            receive_stream_handles_for_listener.clone().lock().await.push(task);
                         }
                         Err(e) => {
                             error!("Failed to accept new stream: {}", e);
@@ -125,14 +143,15 @@ impl Session {
                 loop {
                     // Check exit condition
                     if *this.state.read().await == SessionState::Closed {
+                        debug!("Session closed. Exiting receiver.");
                         break;
                     }
                     // Enumerate the list and push to the message pool
-                    for task in receive_stream_handlers.lock().await.drain(..) {
+                    for task in receive_stream_handles.lock().await.drain(..) {
                         // Check if the task is done
                         match task.await {
-                            Ok(msg) => {
-                                match msg {
+                            Ok(res) => {
+                                match res {
                                     Ok(msg) => {
                                         // Push the message to the message pool
                                         MESSAGES.write().await.push(msg);
@@ -154,11 +173,12 @@ impl Session {
             });
 
             let this = dispatcher_this;
-            let dispatcher: JoinHandle<Result<()>> = tokio::spawn(async move {
+            let _dispatcher: JoinHandle<Result<()>> = tokio::spawn(async move {
                 // Loop and send messages from `self.send` to peer
                 loop {
                     // Check exit condition
                     if *this.state.read().await == SessionState::Closed {
+                        debug!("Session closed. Exiting dispatcher.");
                         break;
                     }
                     let this = this.clone();
@@ -169,7 +189,7 @@ impl Session {
                             debug!("Got message from send queue");
                             debug!("Queue length: {}", send_list.len());
                             msg
-                        },
+                        }
                         None => {
                             // No messages to be sent, wait for new messages.
                             continue;
@@ -180,7 +200,7 @@ impl Session {
                     match this.send(msg).await { // Return a new task
                         Ok(task) => {
                             // Message stream scheduled to be sent
-                            send_stream_handlers_for_sender.lock().await.push(task);
+                            send_stream_handles_for_sender.lock().await.push(task);
                             continue;
                         }
                         Err(e) => {
@@ -200,10 +220,11 @@ impl Session {
                 loop {
                     // Check exit condition
                     if *this.state.read().await == SessionState::Closed {
+                        debug!("Session closed. Exiting sender.");
                         break;
                     }
                     // Enumerate the list and wait
-                    for task in send_stream_handlers.lock().await.drain(..) {
+                    for task in send_stream_handles.lock().await.drain(..) {
                         // Check if the task is done
                         match task.await {
                             Ok(_) => {
@@ -221,23 +242,113 @@ impl Session {
                 Ok(())
             });
             // Join sub-tasks.
-            listener.await??;
-            dispatcher.await??;
             sender.await??;
             receiver.await??;
+            let this = collector_this;
+            this.set_state(SessionState::Terminated).await;
+            // Set to terminated and wait for garbage collection
+            debug!("Session terminated. Waiting for garbage collection.");
             Ok(())
         }));
         // Return a new instance
-        ret
+        Ok(ret)
     }
     /// Authenticate with peer
-    async fn auth(&self) -> Result<()> {
-        // Temporarily not implemented
+    async fn auth(self: Arc<Self>) -> Result<()> {
+        // Should be waited.
+        // Send a message to peer
+        debug!("Authenticating with peer");
+        match self.me {
+            Some(ref me) => {
+                // TODO send verification message
+                let msg = Message {
+                    user: me.clone(),
+                    time: SystemTime::now(),
+                    data: Body::Auth,
+                };
+                let msg = serde_json::to_vec(&msg)?;
+                debug!("Sending auth message: {:?}", msg);
+                // write immediately
+                let (mut send, mut recv) = self.conn.open_bi().await?;
+                send.write_all(msg.as_slice()).await?;
+                send.finish().await?;
+                debug!("Auth message sent, {} bytes. Waiting for reply.", msg.len());
+                // wait for reply
+                let buf = recv.read_to_end(MAX_AUTH_READ_LEN).await?;
+                let msg: Message = serde_json::from_slice(buf.as_slice())?;
+                debug!("Got reply: {:?}", msg);
+                match msg.data {
+                    Body::Control(c) => {
+                        match c {
+                            Control::Verified => {
+                                debug!("Peer verified");
+                            }
+                            Control::ConnectionDenied => {
+                                debug!("Peer denied connection");
+                                bail!("connection denied")
+                            }
+                            _ => {
+                                debug!("Peer replied with unexpected control message");
+                                bail!("unexpected control message")
+                            }
+                        }
+                    }
+                    _ => {
+                        debug!("Peer replied with unexpected message type");
+                        bail!("unexpected message type")
+                    }
+                };
+            }
+            None => {
+                debug!("User is empty");
+                bail!("user empty")
+            }
+        }
         Ok(())
     }
     /// Verify peer
-    async fn verify(&self) -> Result<()> {
-        // Temporarily not implemented
+    async fn verify(self: Arc<Self>) -> Result<()> {
+        // Should be waited.
+        match self.me {
+            Some(ref me) => {
+                // wait for peer auth
+                debug!("Waiting for peer auth");
+                let (mut send, mut recv) = self.conn.accept_bi().await?;
+                debug!("Got new stream");
+                let buf = recv.read_to_end(MAX_AUTH_READ_LEN).await?;
+                let msg: Message = serde_json::from_slice(buf.as_slice())?;
+                debug!("Read auth message from peer stream {} bytes: {:?}", buf.len(), msg);
+                match msg.data {
+                    Body::Auth => {
+                        // TODO Verify the user
+                        debug!("Auth message received, verifying");
+                        debug!("Peer verified. Reply to peer.");
+                        let reply = Message {
+                            user: me.clone(),
+                            time: SystemTime::now(),
+                            data: Body::Control(Control::Verified),
+                        };
+                        let reply = serde_json::to_vec(&reply)?;
+                        // write immediately
+                        send.write_all(reply.as_slice()).await?;
+                        debug!("Reply sent.");
+                        send.finish().await?;
+                        debug!("Stream finished.");
+                        // write peer info to self.peer
+                        *self.peer.write().await = Some(msg.user.clone());
+                        debug!("Peer verified. Peer info: {:?}", self.peer);
+                    }
+                    _ => {
+                        debug!("Peer sent unexpected message type");
+                        bail!("unexpected message type")
+                    }
+                };
+            }
+            None => {
+                debug!("User is empty");
+                bail!("user empty")
+            }
+        }
         Ok(())
     }
 
@@ -254,7 +365,7 @@ impl Session {
     /// The task should expect a new message or error.
     /// Then reply with a message.
     /// Then closes the stream.
-    async fn accept(self: Arc<Self>) -> Result<tokio::task::JoinHandle<Result<Message>>> {
+    async fn accept(self: Arc<Self>) -> Result<JoinHandle<Result<Message>>> {
         debug!("Waiting for new stream...");
         let stream = self.conn.accept_bi().await?; // This would block?
         let (mut send, mut recv) = stream;
@@ -265,31 +376,39 @@ impl Session {
         );
         let task = tokio::spawn(async move {
             // First, read data from stream
-            let mut buf = [0u8; 1024];
-            let mut msg = Vec::new();
-            debug!("Reading data from stream...");
-            loop {
-                // Check exit condition
-                if *self.state.read().await == SessionState::Closed {
-                    break;
-                }
-
-                let n = recv.read(&mut buf).await?;
-                debug!("Read {:?} bytes from stream", n);
-                match n {
-                    Some(0) | None => break,
-                    Some(n) =>
-                        msg.extend_from_slice(&buf[..n]),
-                }
-            }
-            debug!("Read data from stream: {:?}", msg);
+            let buf = recv.read_to_end(MAX_STREAM_LEN).await?;
+            debug!("Read data from stream: {:?}", buf);
             // Then, parse data
-            let msg = Message::from_bytes(Vec::from(buf));
+            let msg: Message = serde_json::from_slice(&buf)?;
             // recv do not need to close, it will be closed by the sender.
+
+            // Check if the message is a control message
+            match msg.clone().data {
+                Body::Control(c) => {
+                    match c {
+                        Control::CloseByPeer => {
+                            // Close the session
+                            debug!("Received close control message from peer.");
+                            self.set_state(SessionState::Closed).await;
+                            return Ok(msg)
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
             // Then, reply with `send`
-            // TODO: reply with a structured message but not simply a string.
-            let reply = "OK";
-            send.write_all(reply.as_bytes()).await?;
+            match self.make_ack() {
+                Ok(reply) => {
+                    debug!("Sending reply: {:?}", reply);
+                    let reply = serde_json::to_string(&reply)?;
+                    send.write_all(reply.as_bytes()).await?;
+                    debug!("Reply sent. {} bytes. Closing stream.", reply.len());
+                }
+                Err(e) => {
+                    error!("Failed to make ack: {}", e);
+                }
+            };
             // Then, close stream
             send.finish().await?;
             Ok(msg)
@@ -300,18 +419,13 @@ impl Session {
 
     /// Sends a message to peer.
     /// Starts a new task to send message. Returns a join handle to be awaited by caller.
-    async fn send(self: Arc<Self>, msg: Message, ) -> Result<JoinHandle<Result<()>>> {
+    async fn send(self: Arc<Self>, msg: Message) -> Result<JoinHandle<Result<()>>> {
         // If there are messages to send, create a new stream and send it.
         let (mut send, mut recv) = self.conn.open_bi().await?;
         debug!("Opened a new stream to send message");
         let task: JoinHandle<Result<()>> = tokio::spawn(async move {
-            let write_buf = match msg.as_bytes() {
-                Some(buf) => buf,
-                None => {
-                    bail!("string convert to bytes should not fail");
-                }
-            };
-            debug!("Sending message: {:?}", msg.as_string());
+            let write_buf = serde_json::to_vec(&msg)?;
+            debug!("Sending message: {:?}", msg);
             send.write_all(&write_buf).await?;
             send.finish().await?;
             debug!("{} bytes sent", write_buf.len());
@@ -327,25 +441,42 @@ impl Session {
                 }
             }
             debug!("Received reply: {:?}", read_buf);
-            // TODO Deserialize message
-            // Currently treat all messages as `String`
-            let reply = String::from_utf8(read_buf)?;
-            match reply.as_str() {
-                "OK" => {
-                    debug!("Stream transferred data safely.");
+            let reply: Message = serde_json::from_slice(&read_buf)?;
+            match reply.data {
+                Body::Control(c) => {
+                    match c {
+                        Control::Acknowledge => {
+                            debug!("Stream transferred data safely.");
+                        }
+                        Control::RetransmissionRequest => {
+                            error!("Failed to receive echo. Got retransmission request. Putting back to queue.");
+                            // Put back to queue
+                            let mut send_list = self.send.write().await;
+                            send_list.push(msg);
+                        }
+                        _ => {
+                            error!("Failed to receive echo. Wrong control type: {:?}.", c);
+                        }
+                    }
                 }
                 _ => {
-                    error!("Failed to receive echo. Putting back to queue.");
-                    // Put back to queue
-                    let mut send_list = self.send.write().await;
-                    send_list.push(msg);
+                    error!("Failed to receive echo. Wrong message type: {:?}", reply.data);
                 }
-            };
+            }
             Ok(())
         });
         Ok(task)
     }
-
+    pub(crate) async fn close(&self) -> Result<()> {
+        let close_msg = Message {
+            time: SystemTime::now(),
+            user: self.me.clone().unwrap(),
+            data: Body::Control(Control::CloseByPeer),
+        };
+        self.send_now(close_msg).await;
+        self.set_state(SessionState::Terminated).await;
+        Ok(())
+    }
 
     /// Interface for other modules to send message to peer.
     pub(crate) async fn send_message(&self, msg: Message) -> Result<()> {
@@ -353,5 +484,63 @@ impl Session {
         let mut send_list = self.send.write().await;
         send_list.push(msg);
         Ok(())
+    }
+
+    /// Method to send immediate message to peer.
+    /// This method is used to send control message.
+    /// It will not be put into send queue and retransmitted.
+    /// Ignore all errors.
+    async fn send_now(&self, msg: Message) {
+        debug!("Sending immediate close control message to peer {peer}.", peer = self.conn.remote_address());
+        let (mut send, _) = match self.conn.open_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to open stream to send message: {}", e);
+                return;
+            }
+        };
+        let write_buf = match serde_json::to_vec(&msg) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to serialize message: {}", e);
+                return;
+            }
+        };
+        let _ = send.write_all(&write_buf).await;
+        let _ = send.finish().await;
+    }
+
+    /// Check session state, if it is terminated.
+    pub(crate) async fn is_terminated(&self) -> bool {
+        *self.state.read().await == SessionState::Terminated
+    }
+
+
+    /// Snippet to make an ack message.
+    fn make_ack(&self) -> Result<Message> {
+        match self.me {
+            Some(ref m) => {
+                Ok(Message {
+                    time: SystemTime::now(),
+                    user: m.clone(),
+                    data: Body::Control(Control::Acknowledge),
+                })
+            }
+            None => {
+                error!("Failed to make ack. No user information.");
+                bail!("user empty")
+            }
+        }
+    }
+    pub(crate) async fn get_peername(&self) -> Result<String> {
+        // get peer username
+        let peername = match *self.peer.read().await {
+            Some(ref p) => p.clone().username,
+            None => {
+                error!("Failed to get peername");
+                bail!("failed to get peername")
+            }
+        };
+        Ok(peername)
     }
 }

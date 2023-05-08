@@ -70,7 +70,7 @@ pub(crate) async fn connect(
     let rebind = options.rebind;
     // Remote host name overwrite
     let hostname = options
-        .host
+        .hostname
         .as_ref()
         .map_or_else(|| Some(hostname), |x| Some(x.to_string()))
         .ok_or_else(|| anyhow!("no hostname specified"))?;
@@ -83,7 +83,13 @@ pub(crate) async fn connect(
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     info!("Connected at {:?}", start.elapsed());
     // Add session to global sessions list
-    let session = Session::new(conn).await;
+    let session = match Session::new(conn).await {
+        Ok(session) => session,
+        Err(e) => {
+            error!("Failed to create session: {e}");
+            return Err(e);
+        }
+    };
     let mut sessions_list = SESSIONS.write().await;
     sessions_list.push(session);
     debug!(

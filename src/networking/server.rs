@@ -22,26 +22,35 @@ use crate::{Opt, SESSIONS, SHOULD_CLOSE};
 
 pub(crate) async fn server(localhost: SocketAddr, options: Opt) -> Result<JoinHandle<Result<()>>> {
     let (certs, key) = if let (Some(key_path), Some(cert_path)) = (&options.key, &options.cert) {
+        debug!("Loading private key.");
         let key = fs::read(key_path).context("failed to read private key")?;
         let key = if key_path.extension().map_or(false, |x| x == "der") {
+            debug!("Key Format DER");
             rustls::PrivateKey(key)
         } else {
             let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)
                 .context("malformed PKCS #8 private key")?;
             match pkcs8.into_iter().next() {
-                Some(x) => rustls::PrivateKey(x),
+                Some(x) => {
+                    debug!("Key format pkcs8");
+                    rustls::PrivateKey(x)
+                }
                 None => {
                     let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)
                         .context("malformed PKCS #1 private key")?;
                     match rsa.into_iter().next() {
-                        Some(x) => rustls::PrivateKey(x),
+                        Some(x) => {
+                            debug!("Key format pkcs1");
+                            rustls::PrivateKey(x)
+                        }
                         None => {
-                            anyhow::bail!("no private keys found");
+                            bail!("no private keys found");
                         }
                     }
                 }
             }
         };
+        debug!("Loading cert chain.");
         let cert_chain = fs::read(cert_path).context("failed to read certificate chain")?;
         let cert_chain = if cert_path.extension().map_or(false, |x| x == "der") {
             vec![rustls::Certificate(cert_chain)]
@@ -55,12 +64,16 @@ pub(crate) async fn server(localhost: SocketAddr, options: Opt) -> Result<JoinHa
 
         (cert_chain, key)
     } else {
+        debug!("Cert not found from given path, trying default path.");
         let dirs = directories_next::ProjectDirs::from("dev", "merlyn", "quic-talk").unwrap();
         let path = dirs.data_local_dir();
         let cert_path = path.join("cert.der");
         let key_path = path.join("key.der");
         let (cert, key) = match fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?))) {
-            Ok(x) => x,
+            Ok(x) => {
+                debug!("Found.");
+                x
+            }
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                 debug!("Generating self-signed certificate");
                 let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -69,22 +82,31 @@ pub(crate) async fn server(localhost: SocketAddr, options: Opt) -> Result<JoinHa
                 fs::create_dir_all(path).context("failed to create certificate directory")?;
                 fs::write(&cert_path, &cert).context("failed to write certificate")?;
                 fs::write(&key_path, &key).context("failed to write private key")?;
+                debug!("Written to {key_path:?} and {cert_path:?}.");
                 (cert, key)
             }
             Err(e) => {
+                debug!("Cannot read certificate.");
                 bail!("failed to read certificate: {}", e);
             }
         };
-
+        debug!("Done");
         let key = rustls::PrivateKey(key);
         let cert = rustls::Certificate(cert);
         (vec![cert], key)
     };
-
+    debug!("Configuring server.");
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+        .with_single_cert(certs, key);
+    let mut server_crypto = match server_crypto {
+        Ok(x) => x,
+        Err(e) => {
+            panic!("Critical error: {e:?}");
+        },
+    };
+
     server_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
     if options.keylog {
         server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -104,19 +126,11 @@ pub(crate) async fn server(localhost: SocketAddr, options: Opt) -> Result<JoinHa
     //    if !root.exists() {
     //        bail!("root path does not exist");
     //    }
-
+    debug!("Listening");
     let endpoint = quinn::Endpoint::server(server_config, localhost)?;
     info!("Listening on {}", endpoint.local_addr()?);
     let task: JoinHandle<Result<()>> = tokio::spawn(async move {
         while let Some(connecting) = endpoint.accept().await {
-            if *SHOULD_CLOSE.clone().read().await {
-                debug!("Closing server task.");
-                for session in SESSIONS.write().await.iter_mut() {
-                    // Close all sessions
-                    session.set_state(SessionState::Closed).await;
-                }
-                break;
-            }
             // Accept connections from different remote socket
             debug!("New connection accepted");
             let connection = connecting.await?;
@@ -124,7 +138,13 @@ pub(crate) async fn server(localhost: SocketAddr, options: Opt) -> Result<JoinHa
                 "Connection incoming from {remote:?}",
                 remote = connection.remote_address()
             );
-            let session = Session::new(connection).await;
+            let session = match Session::new(connection).await {
+                Ok(x) => x,
+                Err(e) => {
+                    error!("Failed to create session: {e:?}");
+                    continue;
+                },
+            };
             let mut sessions_list = SESSIONS.write().await;
             sessions_list.push(session);
             debug!(

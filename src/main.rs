@@ -3,10 +3,8 @@ mod networking;
 mod state;
 mod ui;
 mod message;
+mod user;
 
-
-use message::Message;
-use state::QuicTalkState;
 
 // external imports
 use clap::Parser;
@@ -16,26 +14,42 @@ use std::{
     path::{self, Path, PathBuf},
     str,
     sync::Arc,
+    io::Write,
+    process::exit,
+    sync::Condvar,
+    panic::{self, PanicInfo},
+    backtrace::Backtrace,
 };
-use std::io::Write;
-use std::process::exit;
-use std::sync::Condvar;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, error, info, info_span, Level, trace};
 use tracing_futures::Instrument as _;
 use url::Url;
 use lazy_static::lazy_static;
-use networking::{session::Session};
-use tokio::sync::{RwLock, Mutex};
-use tokio::io;
-use std::sync::atomic::{AtomicBool};
-use tokio::task::JoinHandle;
 use signal_hook::consts::{SIGINT};
-use tokio::io::AsyncWriteExt;
-use crate::networking::{connect, server};
-use crate::networking::session::SessionState;
 
+use tokio::{
+    sync::{RwLock, Mutex},
+    task::JoinHandle,
+    io::{self, AsyncWriteExt},
+    time,
+};
+use url::quirks::username;
+use crate::{
+    networking::{
+        connect,
+        server,
+        session::{
+            Session,
+            SessionState,
+        },
+    },
+    message::Message,
+    state::QuicTalkState,
+    user::User,
+    ui::UI,
+};
+use crate::message::Body;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "quic-talk", version = "0.1.0", about = "A simple QUIC chat application")]
@@ -70,7 +84,7 @@ struct Opt {
 
     /// Host name to overwrite (Client only), optional.
     #[arg(long)]
-    host: Option<String>,
+    hostname: Option<String>,
 
     /// Simulate NAT rebinding after connecting
     #[arg(long)]
@@ -86,7 +100,9 @@ lazy_static! {
     static ref SESSIONS: Arc<RwLock<Vec<Arc<Session>>>> = Arc::new(RwLock::new(Vec::new()));
     static ref MESSAGES: Arc<RwLock<Vec<Message>>> = Arc::new(RwLock::new(Vec::new())); // Messages to be shown in the UI
     static ref SHOULD_CLOSE: Arc<RwLock<bool>> = Arc::new(RwLock::new(false)); // Since this is a frequently accessed variable, we use a RwLock instead of a Mutex
-    static ref STDIN_BUFFER: Arc<RwLock<Vec<u8>>> = Arc::new(RwLock::new(Vec::new()));
+    // static ref STDIN_BUFFER: Arc<RwLock<Vec<u8>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref ME: RwLock<Option<User>> = RwLock::new(None);
+
 }
 
 
@@ -95,6 +111,14 @@ async fn main() -> Result<()> {
     // SIGINT handler
     let mut signals = signal_hook::iterator::Signals::new(&[SIGINT])?;
     let should_close = SHOULD_CLOSE.clone();
+    // abort on panic
+    panic::set_hook(Box::new(|info| {
+        //let stacktrace = Backtrace::capture();
+        let stacktrace = Backtrace::force_capture();
+        println!("Got panic. @info:{}\n@stackTrace:{}", info, stacktrace);
+        std::process::abort();
+    }));
+
     tokio::spawn(async move {
         let mut ctrl_c_count = 0usize;
         for _ in signals.forever() {
@@ -105,6 +129,7 @@ async fn main() -> Result<()> {
             let mut should_close = should_close.write().await;
             *should_close = true;
             info!("Caught SIGINT, closing...");
+            debug!("Pressed {ctrl_c_count} times, SHOULD_CLOSE state: {should_close}");
         }
         info!("Force exiting...");
         exit(1);
@@ -117,13 +142,28 @@ async fn main() -> Result<()> {
             .finish(),
     )
         .unwrap();
+    trace!("Starting");
     let opt = Opt::parse();
+
+    // Setup test user
+    // TODO just testing
+    {
+        let mut me = ME.write().await;
+        if opt.mode == "client" {
+            *me = Some(User::new("client".to_string(), "localhost@localhost".to_string(), "a7d399659b333e931046e4959e635e32".to_string()));
+        } else {
+            *me = Some(User::new("server".to_string(), "localhost@localhost".to_string(), "e8b32bc4d7b564ac6075a1418ad8841e".to_string()));
+        }
+    }
+
 
     // create a server task
     // TODO check config for server
 
     let server = if opt.mode == "server" {
-        server(opt.listen, opt.clone()).await?} else {
+        debug!("Server mode.");
+        server(opt.listen, opt.clone()).await?
+    } else {
         tokio::spawn(async move { Ok(()) })
     };
 
@@ -137,31 +177,6 @@ async fn main() -> Result<()> {
         }
     };
 
-
-    let dispatcher: JoinHandle<Result<()>> = tokio::spawn(async move {
-        loop {
-            // TODO check config for client
-            if *SHOULD_CLOSE.clone().read().await {
-                break;
-            }
-            let mut messages_queue = MESSAGES.write().await;
-            let messages = messages_queue.drain(..);
-            if messages.len() == 0 {
-                continue;
-            }
-            debug!("MESSAGE queue have {len} messages.", len = messages.len());
-
-            io::stdout().flush().await?; // will block when stdin is reading
-            for message in messages {
-                debug!("Got message {msg:?} from MESSAGES queue.",
-                    msg = message);
-                println!(">>{}", message.as_string().ok_or(anyhow!("Failed to convert message to string"))?);
-            }
-        }
-        Ok(())
-    });
-
-    let console = ui::UI::console()?;
     //
     // let console: JoinHandle<Result<()>> = tokio::spawn(async move {
     //     debug!("Starting console");
@@ -195,11 +210,47 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { Ok(()) })
     };
 
-    console.await??;
-    server.await??;
-    client.await??;
-    dispatcher.await??;
-    Ok(())
+    // Garbage collector is not waited
+    let _gc: JoinHandle<Result<()>> = tokio::spawn(async move {
+        loop {
+            let mut sessions = SESSIONS.write().await;
+            let mut i = 0;
+            while i < sessions.len() {
+                if sessions[i].is_terminated().await {
+                    debug!("Session with {:?} terminated, removing...", sessions[i].get_peername().await);
+                    sessions.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            time::sleep(time::Duration::from_secs(1)).await;
+        }
+        Ok(())
+    });
+    // Do not load console unless session is ready
+    while SESSIONS.read().await.len() > 0 {
+        time::sleep(time::Duration::from_secs(1)).await;
+    }
+    let _console = UI::console()?;
+    // Gather all tasks
+    loop {
+        let should_close = *SHOULD_CLOSE.clone().read().await;
+        if should_close {
+            if SESSIONS.read().await.len() == 0 {
+                debug!("No session available, closing...");
+                exit(0); // end without waiting if no session is available
+            } else {
+                debug!("Session available, waiting for session to close...");
+                for session in SESSIONS.write().await.iter_mut() {
+                    // Close all sessions
+                    session.close().await;
+                }
+                break;
+            }
+        }
+    }
+    debug!("All tasks finished, exiting...");
+    exit(0);
 }
 
 fn resolve_url(url: String) -> Result<(String, SocketAddr)> {
@@ -226,15 +277,4 @@ fn resolve_url(url: String) -> Result<(String, SocketAddr)> {
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
 
     Ok((host.to_string(), remote))
-}
-
-#[cfg(test)]
-mod test {
-    #[test]
-    fn main() {
-        println!("Hello, world!");
-    }
-
-    #[tokio::test]
-    async fn stream_test() {}
 }
